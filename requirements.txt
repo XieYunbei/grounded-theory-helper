@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+openai
+plotly
+graphviz
+openpyxl
+xlsxwriter
+scikit-learn
+altair
+matplotlib
+networkx
+streamlit-sortables
