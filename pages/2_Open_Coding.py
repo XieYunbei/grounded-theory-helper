@@ -342,6 +342,7 @@ with st.container(border=True):
         st.session_state.openai_key = st.text_input("OpenAI Key (GPT-4o)", type="password", value=st.session_state.get('openai_key', ''), help="用于 GPT-4o")
         st.session_state.gemini_key = st.text_input("Gemini Key (Gemini)", type="password", value=st.session_state.get('gemini_key', ''), help="用于 Gemini")
         st.markdown("""<small>[获取DashScope Key](https://bailian.console.aliyun.com/?tab=model#/api-key)</small>""", unsafe_allow_html=True)
+        st.markdown("""<small>[领取学生300元优惠券](https://university.aliyun.com/?userCode=r3yteowb)</small>""", unsafe_allow_html=True)
     
     with col_model:
         st.markdown("###### 🧠 模型选择")
@@ -630,3 +631,4 @@ if not st.session_state.open_codes.empty:
         )
         st.download_button("🚀 下载项目 (.xlsx)", data=excel_data, file_name=f"Project_{st.session_state.core_theme}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
         st.page_link("pages/3_Axial_Coding.py", label="下一步 (轴心编码)", icon="➡️")
+
