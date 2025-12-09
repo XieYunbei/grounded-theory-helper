@@ -352,6 +352,7 @@ with st.container(border=True):
             "🚀 Gemini 2.5 Pro (Google 旗舰)": "gemini-2.5-pro",
             "💎 GLM-4.6 (智谱AI旗舰)": "glm-4.6",
             "🔥 DeepSeek-V3 (逻辑强)": "deepseek-v3",
+            "🔥 DeepSeek-R1 (深度思考)": "deepseek-r1",
             "⚖️ Qwen-Plus (平衡推荐)": "qwen-plus",
         }
         model_ids = list(model_options.values())
@@ -388,11 +389,11 @@ with st.container(border=True):
                     else: st.error(f"生成失败: {data}")
                 else: st.error(api_res["error"])
 
-    # --- 模式 B: 外部辅助 (傻瓜版) ---
-    elif st.session_state.prompt_mode == "2. 外部辅助 (傻瓜版)":
-        st.info("📋 **傻瓜模式：** 利用网页版 AI 强大的推理能力生成标准，然后将结果粘贴回来。")
+    # --- 模式 B: 外部辅助 (推荐，需用到网页端，大模型迭代版本更新) ---
+    elif st.session_state.prompt_mode == "2. 外部辅助 (推荐，需用到网页端，大模型迭代版本更新) ":
+        st.info("📋 **火箭模式：** 利用网页版 AI 强大的推理能力生成标准，然后将结果粘贴回来。")
         help_prompt = f"""我正在做关于【{st.session_state.core_theme}】的扎根理论编码。
-请为我制定两个标准：1. 纳入标准 (Definition Logic)：请用一句话定义，什么样的文本才算属于这个主题？ 2. 排除标准 (Exclusion Logic)：请用一句话定义，什么样即使沾边但也必须排除的内容？
+请为我制定两个标准：1. 纳入标准：请用一句话定义，什么样的文本才算属于这个主题？ 2. 排除标准：请用一句话定义，什么样即使沾边但也必须排除的内容？
 请严格按照 “1. 纳入标准：...” 和 “2. 排除标准：...” 的格式直接给出这两段话，不要其他废话。"""
         
         with st.expander("📋 点击展开：复制求助指令", expanded=True):
@@ -413,7 +414,7 @@ with st.container(border=True):
     # --- 公共区域：显示/编辑标准 ---
     st.divider()
 
-    if st.session_state.prompt_mode in ["1. 智能向导 (全自动)", "2. 外部辅助 (傻瓜版)"]:
+    if st.session_state.prompt_mode in ["1. 智能向导 (全自动)", "2. 外部辅助 (推荐，需用到网页端，大模型迭代版本更新) "]:
         col_def, col_exc = st.columns(2)
         with col_def:
             st.session_state.definition_logic = st.text_area("✅ 纳入标准 (Definition)", value=st.session_state.definition_logic, height=100)
@@ -631,4 +632,5 @@ if not st.session_state.open_codes.empty:
         )
         st.download_button("🚀 下载项目 (.xlsx)", data=excel_data, file_name=f"Project_{st.session_state.core_theme}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
         st.page_link("pages/3_Axial_Coding.py", label="下一步 (轴心编码)", icon="➡️")
+
 
