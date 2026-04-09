@@ -1,19 +1,90 @@
-# pages/1_Data_Upload.py (FIXED FOR EXCEL PROVENANCE)
 import streamlit as st
 import pandas as pd
 import docx 
 import re
 import os
 import datetime
+from paths import get_project_paths
 
-# =======================================================================
-# 辅助函数：智能分块读取 (保持不变)
-# =======================================================================
-CHUNK_SIZE = 800 
+# -----------------------------------------------------------------------
+# 【必须加在所有页面 import 之后的第一段】
+# -----------------------------------------------------------------------
+# 1. 检查有没有登录？没登录直接踢回主页
+if not st.session_state.get("authentication_status"):
+    st.info("请先登录系统 🔒")
+    st.switch_page("Home.py") # 强制跳转回登录页
+    st.stop() # 停止运行下面的代码
 
-def ensure_save_dir():
-    if not os.path.exists(SAVE_DIR):
-        os.makedirs(SAVE_DIR)
+# ==============================
+# 🧠 项目选择系统（Sidebar）
+# ==============================
+st.sidebar.title("📁 项目管理")
+
+username = st.session_state.get("username")
+user_base = os.path.join("users_data", username)
+
+os.makedirs(user_base, exist_ok=True)
+
+# 1️⃣ 获取已有项目
+existing_projects = [
+    d for d in os.listdir(user_base)
+    if os.path.isdir(os.path.join(user_base, d))
+]
+
+# 2️⃣ 新建项目
+new_project = st.sidebar.text_input("➕ 新建项目")
+
+if st.sidebar.button("创建项目"):
+    if new_project:
+        new_path = os.path.join(user_base, new_project)
+        os.makedirs(new_path, exist_ok=True)
+
+        # 创建后直接切到新项目
+        st.session_state["active_project_selector"] = new_project
+        st.session_state["current_project"] = new_project
+
+        st.sidebar.success(f"项目已创建: {new_project}")
+        st.rerun()
+
+# 3️⃣ 只初始化一次
+if "active_project_selector" not in st.session_state:
+    st.session_state["active_project_selector"] = existing_projects[0] if existing_projects else None
+
+# 4️⃣ 如果 session 里的项目不存在了，就回退到第一个
+if existing_projects:
+    if st.session_state["active_project_selector"] not in existing_projects:
+        st.session_state["active_project_selector"] = existing_projects[0]
+else:
+    st.session_state["active_project_selector"] = None
+
+# 5️⃣ 选择项目（核心：绑定同一个 key）
+if existing_projects:
+    st.sidebar.selectbox(
+        "选择项目",
+        existing_projects,
+        key="active_project_selector"
+    )
+else:
+    st.sidebar.warning("暂无项目，请先创建项目")
+
+# 6️⃣ 同步到 current_project（如果你后面代码还在用 current_project）
+selected_project = st.session_state.get("active_project_selector")
+
+if selected_project:
+    st.session_state["current_project"] = selected_project
+
+
+username = st.session_state.get("username")
+project_name = st.session_state.get("current_project")
+
+if not project_name:
+    st.warning("⚠️ 请先在左侧选择或创建项目")
+    st.stop()
+
+paths = get_project_paths(username, project_name)
+
+# ✅ 替换原 SAVE_DIR
+SAVE_DIR = paths["preprocessed"]
 
 def ensure_save_dir():
     if not os.path.exists(SAVE_DIR):
@@ -371,4 +442,4 @@ if st.session_state.processed_df is not None:
         st.download_button("💾 下载处理后的数据 (.csv)", csv, "processed_data.csv", "text/csv")
     with c3:
         st.session_state.final_coding_data = df_final
-        st.button("➡️ 前往编码 (Go to Coding)", type="primary", on_click=lambda: st.switch_page("pages/2_Open_Coding.py"))
+        st.page_link("pages/2_Open_Coding.py", label="前往编码 (Go to Coding)", icon="➡️")
