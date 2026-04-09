@@ -7,49 +7,196 @@ import os
 import glob
 from datetime import datetime
 from io import BytesIO
+from prompts import create_axial_coding_prompt
+from paths import get_project_paths
+
+AXIAL_CODES_COLUMNS = ['code', 'category', 'confidence', 'reasoning', 'status']
+
+
+
+# -----------------------------------------------------------------------
+# 【必须加在所有页面 import 之后的第一段】
+# -----------------------------------------------------------------------
+# 1. 检查有没有登录？没登录直接踢回主页
+if not st.session_state.get("authentication_status"):
+    st.info("请先登录系统 🔒")
+    st.switch_page("Home.py") # 强制跳转回登录页
+    st.stop() # 停止运行下面的代码
+
+def load_latest_dims_text_with_fallback(folder_path):
+    try:
+        # 1️⃣ 找所有目标文件
+        files = glob.glob(os.path.join(folder_path, "aligned_merge_category_*.xlsx"))
+
+        if not files:
+            raise FileNotFoundError("没有找到分析结果文件")
+
+        # 2️⃣ 按修改时间排序，取最新
+        latest_file = max(files, key=os.path.getmtime)
+
+        # 3️⃣ 读取 sheet2
+        dims_df = pd.read_excel(latest_file, sheet_name="axial_dimensions")
+
+        if not dims_df.empty and "dimension" in dims_df.columns:
+            lines = []
+            for _, row in dims_df.iterrows():
+                dim = str(row.get("dimension", "")).strip()
+                definition = str(row.get("definition", "")).strip()
+
+                if dim:
+                    if definition:
+                        lines.append(f"{dim}：{definition}")
+                    else:
+                        lines.append(dim)
+
+            if lines:
+                return "\n".join(lines)
+
+    except Exception as e:
+        print(f"[WARN] 读取维度失败：{e}")
+
+    # 4️⃣ fallback
+    return """情绪识别：情绪识别的分类定义
+情绪调节：情绪识别的分类定义
+社会支持：情绪识别的分类定义"""
+
+DEFAULT_DIMS_TEXT = load_latest_dims_text_with_fallback("analysis_final")
+
+def get_api_key(provider_name: str) -> str:
+    try:
+        return st.secrets[provider_name]
+    except Exception:
+        return os.environ.get(provider_name, "")
 
 # =======================================================================
-# 0. 数据持久化与恢复模块 (Data Persistence)
+# 0. 数据持久化与恢复模块 (适配多项目模式)
 # =======================================================================
 
-RECOVERY_DIR = "recovery_axial_coding"
+USER_ROOT = st.session_state.get('user_root_dir', '')
+
+def init_axial_session_state():
+    defaults = {
+        "ax_proj_select": "default_project",
+        "selected_model": "qwen-plus",
+        "model_id": "qwen-plus",
+        "api_key": "",
+        "open_codes": None,
+        "axial_codes_df": pd.DataFrame(columns=AXIAL_CODES_COLUMNS),
+        "codes_to_review": [],
+        "ai_suggestions": {},
+        "all_unique_codes": [],
+        "is_running_axial": False,
+        "total_token_usage": 0,
+        "dims_input_text": DEFAULT_DIMS_TEXT,
+        "core_theme": "",
+        "axial_mode": "🔸 半自动模式",
+    }
+
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_axial_session_state()
+
+def hard_reset_axial_project():
+    st.session_state.open_codes = None
+    st.session_state.axial_codes_df = pd.DataFrame(columns=AXIAL_CODES_COLUMNS)
+    st.session_state.codes_to_review = []
+    st.session_state.ai_suggestions = {}
+    st.session_state.all_unique_codes = []
+    st.session_state.is_running_axial = False
+    st.session_state.total_token_usage = 0
+    st.session_state.dims_input_text = DEFAULT_DIMS_TEXT
+    st.session_state.core_theme = ""
+    st.session_state.axial_mode = "🔸 半自动模式"
+
+    for key in ["dims_input_area", "helper_dims_input"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+# 项目选择
+existing_projects = [d for d in os.listdir(USER_ROOT) if os.path.isdir(os.path.join(USER_ROOT, d))]
+
+if not existing_projects:
+    st.warning("请先创建项目")
+    st.stop()
+
+if st.session_state.get("active_project_selector") not in existing_projects:
+    st.session_state["active_project_selector"] = existing_projects[0]
+    
+with st.sidebar:
+    if not existing_projects:
+        st.error("❌ 没有可用项目")
+        st.stop()
+
+    st.selectbox(
+        "项目管理",
+        options=existing_projects,
+        key="active_project_selector",
+        on_change=hard_reset_axial_project
+    )
+    st.info("系统会自动将您的编码结果保存到云端文件夹中。")
+
+selected_project = st.session_state["active_project_selector"]
+username = st.session_state.get("username")
+DIRS = get_project_paths(username, selected_project)
+
+# 定义路径：users_data/用户名/项目名/4_axial_coding
+RECOVERY_DIR = DIRS["axial_autosave"]
 
 def ensure_recovery_dir():
     if not os.path.exists(RECOVERY_DIR):
-        os.makedirs(RECOVERY_DIR)
+        os.makedirs(RECOVERY_DIR, exist_ok=True)
 
 def get_current_filename(topic, mode):
-    """
-    生成文件名：主题_模式_日期.jsonl
-    """
     safe_topic = "".join([c for c in topic if c.isalnum() or c in (' ', '_', '-')]).strip()
     if not safe_topic: safe_topic = "Untitled"
-    
     safe_mode = "Auto" if "自动" in mode else "Semi" if "半自动" in mode else "Strict"
     date_str = datetime.now().strftime("%Y%m%d") 
-    
-    return f"{safe_topic}_{safe_mode}_{date_str}.jsonl"
+    return f"Axial_{selected_project}_{safe_topic}_{safe_mode}_{date_str}.jsonl"
 
 def save_record_to_jsonl(record_dict, filename):
     ensure_recovery_dir()
-    filepath = os.path.join(RECOVERY_DIR, filename)
+    filepath = os.path.join(RECOVERY_DIR, filename) # 这里会自动存入项目文件夹
     record_dict['timestamp'] = datetime.now().isoformat()
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(json.dumps(record_dict, ensure_ascii=False) + "\n")
 
+def parse_dimension_names(dim_text):
+    dims = []
+    for line in str(dim_text).splitlines():
+        line = str(line).strip()
+        if not line:
+            continue
+
+        if "：" in line:
+            name = line.split("：", 1)[0].strip()
+        elif ":" in line:
+            name = line.split(":", 1)[0].strip()
+        else:
+            name = line.strip()
+
+        if name and name not in dims:
+            dims.append(name)
+
+    if "无对应维度" not in dims:
+        dims.append("无对应维度")
+    return dims
+
+
+def normalize_text(s):
+    return str(s).replace("\u3000", " ").replace("\n", " ").replace("\r", "").strip()
+
 def load_from_jsonl(filepath):
+    # 此处的 filepath 通常是用户从当前项目文件夹中选中的
     data = []
     if os.path.exists(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     data.append(json.loads(line))
-                except:
-                    continue
-    if data:
-        return pd.DataFrame(data)
-    else:
-        return pd.DataFrame()
+                except: continue
+    return pd.DataFrame(data) if data else pd.DataFrame()
 
 # =======================================================================
 # 1. 核心逻辑函数区
@@ -57,33 +204,26 @@ def load_from_jsonl(filepath):
 
 def call_qwen_api(api_key, model_id, messages, temperature=0.1):
     try:
-        # 兼容多平台 API 调用
-        if model_id in ["qwen-max", "qwen-plus", "deepseek-v3", "deepseek-r1", "kimi-k2-thinking", "glm-4.6"]:
-            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            client_key = api_key 
-        elif model_id.startswith("gpt"):
+        if model_id.startswith("gpt-4o"):
             base_url = "https://api.openai.com/v1"
-            client_key = st.session_state.get('openai_key', api_key) 
+            client_key = api_key
         elif model_id.startswith("gemini"):
-            base_url = "https://api.gemini.com/v1" 
-            client_key = st.session_state.get('gemini_key', api_key) 
+            base_url = "https://api.gemini.com/v1"
+            client_key = api_key
         else:
             base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             client_key = api_key
 
         client = OpenAI(api_key=client_key, base_url=base_url)
-        
+
         response = client.chat.completions.create(
             model=model_id,
             temperature=temperature,
             messages=messages,
         )
         usage = response.usage
-        if usage:
-            total_tokens = getattr(usage, "total_tokens", 0)
-        else:
-            total_tokens = 0
-            
+        total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+
         content = response.choices[0].message.content
         if not content:
             return {"success": False, "error": "API 返回了空内容", "tokens": total_tokens}
@@ -110,19 +250,37 @@ def to_excel_axial(axial_mapping_df, original_df=None):
     """
     output = BytesIO()
     
+# === 安全合并版本 ===
+
     if original_df is not None and not original_df.empty and not axial_mapping_df.empty:
+
         if 'code' in original_df.columns and 'code' in axial_mapping_df.columns:
-            # 准备映射表 (取最新规则)
+
             mapping_rules = axial_mapping_df.drop_duplicates(subset=['code'], keep='last')
-            cols_to_use = [c for c in mapping_rules.columns if c in ['code', 'category', 'confidence', 'reasoning', 'status']]
+
+            cols_to_use = [
+                c for c in mapping_rules.columns
+                if c in ['code', 'category', 'confidence', 'reasoning', 'status']
+            ]
+
             mapping_rules = mapping_rules[cols_to_use]
-            
-            # Left Join
-            merged_df = pd.merge(original_df, mapping_rules, on='code', how='left')
+
+            # 🛡 删除可能冲突列
+            conflict_cols = ['category', 'confidence', 'reasoning', 'status']
+            original_df = original_df.drop(
+                columns=[c for c in conflict_cols if c in original_df.columns]
+            )
+
+            merged_df = pd.merge(
+                original_df,
+                mapping_rules,
+                on='code',
+                how='left'
+            )
+
             merged_df['category'] = merged_df['category'].fillna('待归类')
+
             final_df = merged_df
-        else:
-            final_df = axial_mapping_df
     else:
         final_df = axial_mapping_df
 
@@ -158,64 +316,7 @@ def generate_definitions(api_key, model_id, domain, topic, raw_keywords):
     messages = [{"role": "user", "content": prompt}]
     return call_qwen_api(api_key, model_id, messages, temperature=0.7)
 
-def create_axial_coding_prompt(dimension_list, batch_data):
-    """
-    构建符合扎根理论逻辑的 Prompt
-    batch_data: [{'code': '...', 'quote': '...'}] (quote 可能是拼接后的多条)
-    """
-    dims_display = list(dimension_list)
-    if "无对应维度" not in dims_display:
-        dims_display.append("无对应维度: 该编码无法归入上述任何维度，属于离群点或需要新维度。")
-    
-    dims_str = "\n".join([f"- {d}" for d in dims_display])
-    
-    system_content = f"""
-你是一位执行“轴心编码（Axial Coding）”的质性研究助手。你的任务是将底层的“开放编码”归纳到核心维度中。
 
-【一、编码手册 (Codebook)】
-请严格基于以下维度的**操作性定义**进行分类，严禁仅凭维度名称猜测：
-{dims_str}
-
-【二、操作逻辑：不断比较法 (Constant Comparative Method)】
-虽然你只需输出结果，但请在计算过程中严格执行以下步骤：
-1. **情境还原**：仔细阅读引文（Quote）。若引文包含多条，请综合考虑其共性。若引文缺失或模糊，**下调置信度**。
-2. **竞争性假设**：对于每条数据，不要只看它“像”什么，要反问它“为什么不是”其他维度。
-3. **排他性判断**：如果一条数据同时符合两个维度的定义，选择**语义对应更直接**的那个。
-
-【三、置信度评分量表 (1-5)】
-5: **理论饱和**。编码与定义的关键词完全对应，且引文语境提供了强有力支撑。
-4: **高度匹配**。逻辑通顺，无明显歧义。
-3: **中度匹配**。符合核心定义，但缺乏语境细节，或存在多义性。
-2: **证据不足**。仅有微弱联系，建议人工复核。
-1: **无法判断**。信息缺失或完全不相关。
-
-【四、输出格式】
-仅输出 JSON 数组。不要解释，不要 Markdown。
-
-[
-    {{
-        "CodeName": "...",
-        "AssignedCategory": "...",
-        "Confidence": 5
-    }}
-]
-"""
-    data_input_str = ""
-    for item in batch_data:
-        c = item.get('code', '未知')
-        q = item.get('quote', '')
-        if not q or q == "无" or q == "（无引用）":
-            q_str = "（无语境，仅基于编码分析）"
-        else:
-            q_str = q
-        data_input_str += f"- 编码: {c}\n  引文: {q_str}\n\n"
-
-    user_content = f"请对以下 {len(batch_data)} 条数据进行编码归类，直接返回 JSON 数组：\n\n{data_input_str}"
-
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
-    ]
 
 def handle_axial_acceptance(code_name, category, confidence, reasoning=""):
     # 1. 更新 Session State
@@ -242,7 +343,7 @@ def handle_axial_acceptance(code_name, category, confidence, reasoning=""):
         del st.session_state.ai_suggestions[code_name]
 
     # 2. 自动保存到 JSONL
-    current_topic = st.session_state.get('research_topic_input', 'Unspecified_Topic')
+    current_topic = st.session_state.get('core_theme', 'Unspecified_Topic')
     current_mode = st.session_state.get('axial_mode', 'Manual')
     filename = get_current_filename(current_topic, current_mode)
     
@@ -299,10 +400,9 @@ def get_aggregated_quotes(codes_df, code_name, limit=3):
 st.set_page_config(page_title="区域4: 轴心编码", layout="wide")
 
 with st.sidebar:
-    st.header("📂 进度管理")
-    st.info("系统会自动将您的编码结果保存到 `recovery_axial_coding` 文件夹中。")
+
     
-    ensure_recovery_dir()
+    ensure_recovery_dir()#####
     jsonl_files = glob.glob(os.path.join(RECOVERY_DIR, "*.jsonl"))
     jsonl_files.sort(key=os.path.getmtime, reverse=True)
     
@@ -333,46 +433,119 @@ with st.sidebar:
     else:
         st.caption("暂无历史存档")
 
-st.title("区域4: 轴心编码 Prompt生成与执行区 🧠")
+    if st.button("🗑 清空当前进度",
+                 use_container_width=True):
+        hard_reset_axial_project()
+        st.success("已清空进度")
+        time.sleep(0.5)
+        st.rerun()
 
-if 'open_codes' not in st.session_state: st.session_state.open_codes = None
-if 'api_key' not in st.session_state: st.session_state.api_key = None
-if 'openai_key' not in st.session_state: st.session_state.openai_key = "" 
-if 'gemini_key' not in st.session_state: st.session_state.gemini_key = "" 
-if 'selected_model' not in st.session_state: st.session_state.selected_model = 'qwen-plus' 
-if 'axial_codes_df' not in st.session_state:
-    st.session_state.axial_codes_df = pd.DataFrame(columns=['code', 'category', 'confidence', 'reasoning', 'status'])
-if 'codes_to_review' not in st.session_state: st.session_state.codes_to_review = []
-if 'ai_suggestions' not in st.session_state: st.session_state.ai_suggestions = {} 
-if 'is_running_axial' not in st.session_state: st.session_state.is_running_axial = False
-if 'total_token_usage' not in st.session_state: st.session_state.total_token_usage = 0
-if 'dims_input_text' not in st.session_state: st.session_state.dims_input_text = "情绪识别\n情绪调节\n社会支持"
-if 'research_topic_input' not in st.session_state: st.session_state.research_topic_input = "" 
+st.title("🧠区域4: 轴心编码 ｜ 项目准备: {selected_project}")
 
-# --- 数据加载 ---
-codes_df = None
-if st.session_state.open_codes is not None and not st.session_state.open_codes.empty:
-    codes_df = st.session_state.open_codes
+if st.session_state.get("open_codes") is None or st.session_state.open_codes.empty:
 
-if codes_df is None:
-    st.warning("⚠️ 请先在 Page 2 生成开放编码，或在此上传文件。")
-    uploaded_file = st.file_uploader("📥 上传开放编码文件 (XLSX, CSV, JSON, JSONL)", type=["xlsx", "csv", "json", "jsonl"])
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'): codes_df = pd.read_csv(uploaded_file)
-            elif uploaded_file.name.endswith('.jsonl'): codes_df = pd.read_json(uploaded_file, lines=True)
-            elif uploaded_file.name.endswith('.json'):
-                try: codes_df = pd.read_json(uploaded_file)
-                except ValueError: uploaded_file.seek(0); codes_df = pd.read_json(uploaded_file, lines=True)
-            else: codes_df = pd.read_excel(uploaded_file, engine='openpyxl')
-            
-            if 'code' not in codes_df.columns: st.error("错误：缺少 'code' 列"); st.stop()
-            if 'quote' not in codes_df.columns: codes_df['quote'] = "（无引用）"
-            st.session_state.open_codes = codes_df
-            st.success(f"✅ 加载成功: {len(codes_df)} 条"); st.rerun()
-        except Exception as e: st.error(f"读取失败: {e}"); st.stop()
+    st.info("💡 请载入开放编码结果文件（xlsx/csv/json/jsonl）")
 
-if codes_df is None: st.stop()
+    t1, t2 = st.tabs(["📁 从云端目录导入", "📤 本地上传"])
+    candidate_dirs = [
+        DIRS["analysis_final"],
+        DIRS["opening_final"],
+    ]
+    with t1:
+        all_server_files = []
+
+        for folder in candidate_dirs:
+            if os.path.exists(folder):
+                for f in os.listdir(folder):
+                    if f.endswith((".xlsx", ".csv", ".json", ".jsonl")):
+                        all_server_files.append((folder, f))
+
+        if all_server_files:
+            display_options = ["-- 请选择 --"] + [f"{os.path.basename(folder)} / {fname}" for folder, fname in all_server_files]
+
+            selected_display = st.selectbox(
+                "选择文件:",
+                display_options,
+                key="axial_data_load_key"
+            )
+
+            if st.button("✅ 确认载入数据并开始", type="primary", key="axial_load_server_btn"):
+                if selected_display != "-- 请选择 --":
+                    try:
+                        selected_index = display_options.index(selected_display) - 1
+                        folder, fname = all_server_files[selected_index]
+                        p = os.path.join(folder, fname)
+
+                        if p.endswith(".csv"):
+                            df_loaded = pd.read_csv(p)
+                        elif p.endswith(".jsonl"):
+                            df_loaded = pd.read_json(p, lines=True)
+                        elif p.endswith(".json"):
+                            try:
+                                df_loaded = pd.read_json(p)
+                            except ValueError:
+                                df_loaded = pd.read_json(p, lines=True)
+                        else:
+                            df_loaded = pd.read_excel(p, engine="openpyxl")
+
+                        if 'code' not in df_loaded.columns:
+                            st.error("错误：缺少 'code' 列")
+                            st.stop()
+
+                        if 'quote' not in df_loaded.columns:
+                            df_loaded['quote'] = "（无引用）"
+
+                        st.session_state.open_codes = df_loaded
+                        st.success(f"✅ 已载入 {len(df_loaded)} 条开放编码")
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"读取失败: {e}")
+        else:
+            st.warning("当前项目可用于轴心编码的数据文件夹为空。")
+
+    with t2:
+        uploaded_file = st.file_uploader(
+            "📥 上传开放编码文件",
+            type=["xlsx", "csv", "json", "jsonl"],
+            key="axial_uploader"
+        )
+
+        if uploaded_file:
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df_loaded = pd.read_csv(uploaded_file)
+                elif uploaded_file.name.endswith('.jsonl'):
+                    df_loaded = pd.read_json(uploaded_file, lines=True)
+                elif uploaded_file.name.endswith('.json'):
+                    try:
+                        df_loaded = pd.read_json(uploaded_file)
+                    except ValueError:
+                        uploaded_file.seek(0)
+                        df_loaded = pd.read_json(uploaded_file, lines=True)
+                else:
+                    df_loaded = pd.read_excel(uploaded_file, engine='openpyxl')
+
+                if 'code' not in df_loaded.columns:
+                    st.error("错误：缺少 'code' 列")
+                    st.stop()
+
+                if 'quote' not in df_loaded.columns:
+                    df_loaded['quote'] = "（无引用）"
+
+                st.session_state.open_codes = df_loaded
+                st.success(f"✅ 已载入 {len(df_loaded)} 条开放编码")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"读取失败: {e}")
+                st.stop()
+
+    st.warning("无开放编码数据")
+    st.stop()
+
+# --- 数据就绪 ---
+codes_df = st.session_state.open_codes
 
 all_unique_codes = codes_df['code'].unique().tolist()
 st.session_state.all_unique_codes = all_unique_codes
@@ -388,15 +561,26 @@ with config_col:
     with st.container(border=True):
         st.subheader("步骤 1: 配置与启动")
         
-        api_key_input = st.text_input("🔑 DashScope Key", type="password", value=st.session_state.get('api_key', ''), label_visibility="visible")
-        if api_key_input: st.session_state.api_key = api_key_input
-        
-        model_options = {"👑 Qwen-Max": "qwen-max", "🔥 DeepSeek-V3": "deepseek-v3", "⚖️ Qwen-Plus": "qwen-plus", "🚀 DeepSeek-R1": "deepseek-r1", "🌟 GPT-4o": "gpt-4o"}
+        model_options = {
+            "👑 Qwen-Max": "qwen-max",
+            "🔥 DeepSeek-V3": "deepseek-v3",
+            "⚖️ Qwen-Plus": "qwen-plus",
+            "🚀 DeepSeek-R1": "deepseek-r1",
+            #"🌟 GPT-4o": "gpt-4o"
+            ## "🚀 Gemini": "gemini",
+        }
         model_keys = list(model_options.keys())
         current_key = next((k for k, v in model_options.items() if v == st.session_state.selected_model), model_keys[0])
         sel_label = st.selectbox("🧠 选择模型", options=model_keys, index=model_keys.index(current_key))
         st.session_state.selected_model = model_options[sel_label]
         st.session_state.model_id = st.session_state.selected_model
+
+        if st.session_state.selected_model.startswith("gpt-4o"):
+            st.session_state.api_key = get_api_key("OPENAI_API_KEY")
+        elif st.session_state.selected_model.startswith("gemini"):
+            st.session_state.api_key = get_api_key("GEMINI_API_KEY")
+        else:
+            st.session_state.api_key = get_api_key("QWEN_API_KEY")
 
         st.divider()
         st.markdown("#### 定义轴心维度")
@@ -407,7 +591,7 @@ with config_col:
             col_ctx1, col_ctx2 = st.columns(2)
             input_domain = col_ctx1.text_input("1. 研究领域", placeholder="例如：发展心理学")
             input_topic = col_ctx2.text_input("2. 研究主题", placeholder="例如：青少年叛逆期冲突")
-            if input_topic: st.session_state.research_topic_input = input_topic
+            if input_topic: st.session_state.core_theme = input_topic
             
             raw_dims_input = st.text_area("3. 维度关键词 (用换行分隔)", 
                                          value="", 
@@ -458,8 +642,7 @@ with config_col:
         )
         st.session_state.dims_input_text = dimensions_input
 
-        dimension_list = [line.split(":")[0].strip() for line in dimensions_input.splitlines() if line.strip()]
-        if '无对应维度' not in dimension_list: dimension_list.append('无对应维度')
+        dimension_list = parse_dimension_names(dimensions_input)
         
         st.divider()
         st.markdown("#### 执行控制")
@@ -495,6 +678,7 @@ with config_col:
 
                  messages = create_axial_coding_prompt(dimension_list, test_batch_data)
                  res = call_qwen_api(st.session_state.api_key, st.session_state.model_id, messages)
+
                  if res["success"]:
                      st.session_state.total_token_usage += res["tokens"]
                      st.info(f"测试运行成功 (消耗 {res['tokens']} tokens)")
@@ -545,7 +729,10 @@ with results_col:
         st.subheader(f"待审查 (剩余 {len(st.session_state.codes_to_review)} 条)")
         
         if mode == "🔸 半自动模式":
-            ready_to_show = [c for c in st.session_state.codes_to_review if c in st.session_state.ai_suggestions]
+            ready_to_show = [
+                c for c in st.session_state.codes_to_review
+                if str(c) in [str(k) for k in st.session_state.ai_suggestions.keys()]
+            ]
         else:
             ready_to_show = st.session_state.codes_to_review
 
@@ -618,18 +805,40 @@ with results_col:
     st.subheader("步骤 3: 结果导出")
     if not st.session_state.axial_codes_df.empty:
         st.dataframe(st.session_state.axial_codes_df)
-        
-        export_data = to_excel_axial(st.session_state.axial_codes_df, st.session_state.open_codes)
-        
-        # [MODIFIED] 动态文件名
-        cur_topic = st.session_state.get('research_topic_input', 'Research')
-        safe_topic = "".join([c for c in cur_topic if c.isalnum() or c in (' ', '_', '-')]).strip()
-        if not safe_topic: safe_topic = "Axial_Result"
-        date_str = datetime.now().strftime("%Y%m%d_%H%M")
-        file_name = f"{safe_topic}_{date_str}.xlsx"
-        
-        st.download_button("💾 导出结果 (含原始行)", data=export_data, file_name=file_name)
 
+        excel_data = to_excel_axial(
+            st.session_state.axial_codes_df,
+            st.session_state.open_codes
+        )
+
+        cur_topic = st.session_state.get("core_theme", "").strip()
+        safe_topic = "".join([c for c in cur_topic if c.isalnum() or c in (" ", "_", "-")]).strip()
+        if not safe_topic:
+            safe_topic = "Axial_Result"
+
+        time_str = time.strftime("%Y%m%d_%H%M")
+
+        col1, col2 = st.columns([2, 1])
+        st.caption("💡 保存用于系统内继续分析；下载用于导出到本地")
+
+        with col1:
+            if st.button("💾 保存到项目（用于后续分析）", type="primary", use_container_width=True):
+                filename = f"{safe_topic}_{time_str}_axial_coding.xlsx"
+                save_path = os.path.join(DIRS["axial_final"], filename)
+
+                with open(save_path, "wb") as f:
+                    f.write(excel_data)
+
+                st.success("✅ 已保存到项目文件夹（Step 4）")
+
+        with col2:
+            st.download_button(
+                "⬇️ 下载副本到本地",
+                data=excel_data,
+                file_name=f"Project_{safe_topic}_{time_str}_axial_coding.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 # --- 核心处理逻辑 ---
 if st.session_state.is_running_axial:
     pending_ai_codes = [c for c in st.session_state.codes_to_review if c not in st.session_state.ai_suggestions]
@@ -651,25 +860,77 @@ if st.session_state.is_running_axial:
                 with st.spinner(f"🤖 正在后台分析 {len(batch_codes)} 条数据..."):
                     messages = create_axial_coding_prompt(dimension_list, batch_data)
                     res = call_qwen_api(st.session_state.api_key, st.session_state.model_id, messages)
-                    
                     if res["success"]:
                         st.session_state.total_token_usage += res["tokens"]
                         results = extract_json(res["text"])
                         if isinstance(results, list):
                             for item in results:
-                                c_name = item.get("CodeName")
-                                category = item.get("AssignedCategory")
-                                confidence = item.get("Confidence", 0) 
-                                
-                                st.session_state.ai_suggestions[c_name] = {
-                                    "category": category,
+                                # 兼容不同字段名
+                                c_name = str(
+                                    item.get("CodeName")
+                                    or item.get("code")
+                                    or item.get("Code")
+                                    or ""
+                                ).strip()
+
+                                category = str(
+                                    item.get("AssignedCategory")
+                                    or item.get("category")
+                                    or item.get("Category")
+                                    or "无对应维度"
+                                ).strip()
+
+                                confidence = item.get("Confidence")
+                                if confidence is None:
+                                    confidence = item.get("confidence")
+                                if confidence is None:
+                                    confidence = item.get("Score")
+                                if confidence is None:
+                                    confidence = 0
+
+                                try:
+                                    confidence = int(confidence)
+                                except:
+                                    confidence = 0
+
+                                confidence = max(0, min(5, confidence))
+
+                                # 关键：用 codes_to_review 里原始值做模糊对齐，避免空格/全半角/隐藏字符导致匹配失败
+                                matched_code = None
+                                for raw_code in st.session_state.codes_to_review:
+                                    if str(raw_code).strip() == c_name:
+                                        matched_code = raw_code
+                                        break
+
+                                if matched_code is None:
+                                    # 再做一次宽松匹配
+                                    norm_c_name = c_name.replace("\u3000", " ").replace("\n", " ").replace("\r", "").strip()
+                                    for raw_code in st.session_state.codes_to_review:
+                                        norm_raw = str(raw_code).replace("\u3000", " ").replace("\n", " ").replace("\r", "").strip()
+                                        if norm_raw == norm_c_name:
+                                            matched_code = raw_code
+                                            break
+                                matched_category = "无对应维度"
+                                for dim in dimension_list:
+                                    if normalize_text(dim) == normalize_text(category):
+                                        matched_category = dim
+                                        break
+
+                                st.session_state.ai_suggestions[matched_code] = {
+                                    "category": matched_category,
                                     "confidence": confidence,
                                     "reasoning": ""
-                                }
-                                
+                                }               
+
                                 if mode == "🔹 自动模式":
-                                    handle_axial_acceptance(c_name, category, confidence, "")
-                                    
+
+                                    handle_axial_acceptance(
+                                        matched_code,
+                                        matched_category,
+                                        confidence,
+                                        ""
+                                    )
+
                             st.rerun()
                         else:
                             st.error("⚠️ AI 返回数据格式错误，解析失败。请查看下方原始返回。")
