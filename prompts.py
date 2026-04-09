@@ -132,6 +132,7 @@ def create_final_coding_prompt(core_theme, definition_logic, exclusion_logic, ba
 * 纳入标准: {definition_logic}
 * 排除标准: {exclusion_logic}
 
+
 三、身份协议-必须严格执行
 * 输入文本每一行都带有 ID，例如 [Q-01-001] 或 [A-01-001]。
 * [Q-...] 开头的行：是访谈者/主持人。这些行仅作为理解语境的背景信息。严禁对这些行生成编码！
@@ -148,6 +149,7 @@ def create_final_coding_prompt(core_theme, definition_logic, exclusion_logic, ba
 3.意义单元界定:
     * 判断当前行是否包含多个独立意义？若有，进行语义挖掘（原则二）
     * 判断当前行是否需要联系上文才能读懂？若需，进行语境重组（原则三）
+    * 在确定 ids 后，进一步判断为了让该编码可被人工理解，最少还需要哪些相邻 A 行，并将其写入 evidence_span
 3.穷尽性审计：
     * 重新核对：将你生成的初始代码列表与[待处理文段]进行对比。
     * 检查遗漏：检查原始文段中是否还有任何符合纳入标准的、但未被编码的并列词、转折句或对立概念（例如：既要A又要B）。
@@ -158,17 +160,19 @@ def create_final_coding_prompt(core_theme, definition_logic, exclusion_logic, ba
 7.格式化：生成JSON。
 
 六、输出格式
-只输出一个JSON数组，每个对象必须包含 code 、ids和confidence。
+只输出一个JSON数组，每个对象必须包含 code 、ids、evidence_span 和 confidence。
 多条编码示例:
 [
   {{
     "code": "(第一个编码标签)",
-    "ids": ["A-01-005", "A-01-006"], 
+    "ids": ["A-01-005", "A-01-006"],
+    "evidence_span": ["A-01-004", "A-01-005", "A-01-006"],
     "confidence": 5
   }},
   {{
     "code": "(第二个编码标签)",
-    "ids": ["A-01-006"], 
+    "ids": ["A-01-006"],
+    "evidence_span": ["A-01-005", "A-01-006"],
     "confidence": 4
   }}
 ]
@@ -176,8 +180,6 @@ def create_final_coding_prompt(core_theme, definition_logic, exclusion_logic, ba
 
 [待处理文段]:
 {batch_text}
-
-提醒：严格遵守判别标准与编码步骤，按照规定JSON格式输出！不输出其他内容！
 """
 
 
