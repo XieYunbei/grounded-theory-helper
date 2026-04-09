@@ -1,98 +1,292 @@
-import streamlit as st
+import streamlit as st 
+
 import pandas as pd
-import time 
-from openai import OpenAI 
+import time
+from openai import OpenAI
 import json
-import os 
+import os
 import glob
-from io import BytesIO 
+from io import BytesIO
 import datetime
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from paths import get_project_paths
+from prompts import create_background_meta_prompt, create_final_coding_prompt, get_manual_prompt_template
+
+if not st.session_state.get("authentication_status"):
+    st.info("请先登录系统 🔒")
+    st.switch_page("Home.py") # 强制跳转回登录页
+    st.stop() # 停止运行下面的代码
+
+OPEN_CODES_COLUMNS = [
+    'code', 'quote', 'quote_highlight',
+    'confidence', 'original_ids', 'evidence_span', 'batch_id','source_file'
+]
+
+DEFAULT_CUSTOM_PROMPT = get_manual_prompt_template() or """请在此输入自定义 Prompt，并使用 {batch_text} 作为文本占位符。"""
+
+
+def init_opening_session_state():
+    defaults = {
+        #"active_project_selector": "default_project",
+        "prompt_mode": "1. 智能向导 (全自动)",
+        "custom_prompt": DEFAULT_CUSTOM_PROMPT,
+        "custom_prompt_editor": DEFAULT_CUSTOM_PROMPT,
+        "processed_batches": set(),
+        "open_codes": pd.DataFrame(columns=OPEN_CODES_COLUMNS),
+        "is_coding": False,
+        "test_mode": False,
+        "definition_logic": "",
+        "exclusion_logic": "",
+        "core_theme": "（请在此输入您的研究主题）",
+        "selected_model": "qwen-plus",
+        "openai_key": "",
+        "gemini_key": "",
+        "stop_requested": False,
+        "is_processing": False,
+        "temperature": 0.1,
+        "total_token_usage": 0,
+        "final_coding_data": None,
+        "is_paused": False,
+    }
+
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def hard_reset_opening_project():
+    st.session_state.final_coding_data = None
+    st.session_state.open_codes = pd.DataFrame(columns=OPEN_CODES_COLUMNS)
+    st.session_state.processed_batches = set()
+    st.session_state.core_theme = "（请重新输入主题）"
+    st.session_state.definition_logic = ""
+    st.session_state.exclusion_logic = ""
+    st.session_state.custom_prompt = DEFAULT_CUSTOM_PROMPT
+    st.session_state.custom_prompt_editor = DEFAULT_CUSTOM_PROMPT
+    st.session_state.is_coding = False
+    st.session_state.test_mode = False
+    st.session_state.is_paused = False
+    st.session_state.total_token_usage = 0
+
+
+init_opening_session_state()
+
+if st.session_state.get("open_codes") is None:
+    st.session_state.open_codes = pd.DataFrame(columns=OPEN_CODES_COLUMNS)
+
+current_user = st.session_state.get("username", "default_user")
+USER_BASE_DIR = os.path.join("users_data", current_user)
+
+existing_projects = []
+if os.path.exists(USER_BASE_DIR):
+    existing_projects = [
+        d for d in os.listdir(USER_BASE_DIR)
+        if os.path.isdir(os.path.join(USER_BASE_DIR, d))
+    ]
+
+# 只初始化一次：如果前面页面已经选过，就沿用
+if "active_project_selector" not in st.session_state:
+    st.session_state["active_project_selector"] = existing_projects[0] if existing_projects else None
+
+# 只有当当前项目已经不存在时，才回退
+elif st.session_state["active_project_selector"] not in existing_projects:
+    st.session_state["active_project_selector"] = existing_projects[0] if existing_projects else None
+
+# =========================
+# 🧠 侧边栏：选择项目（唯一来源）
+# =========================
+with st.sidebar:
+    if not existing_projects:
+        st.error("❌ 没有可用项目")
+        st.stop()
+
+    st.selectbox(
+        "项目管理",
+        options=existing_projects,
+        key="active_project_selector",
+        on_change=hard_reset_opening_project
+    )
+
+    st.info("系统会自动将您的编码结果保存到云端文件夹中。")
+
+# ✅ 全页统一使用这个项目
+selected_project = st.session_state["active_project_selector"]
+
+# =========================
+# ✅ DIRS 必须在这里初始化（关键修复）
+# =========================
+DIRS = get_project_paths(current_user, selected_project)
 
 # =======================================================================
-# 0. 数据持久化与恢复模块 (Data Persistence)
+# 0. 数据持久化与恢复模块
 # =======================================================================
 
-RECOVERY_DIR = "recovery_opening_coding"
-
-def ensure_recovery_dir():
-    if not os.path.exists(RECOVERY_DIR):
-        os.makedirs(RECOVERY_DIR)
-
-def ensure_recovery_dir():
-    if not os.path.exists(RECOVERY_DIR):
-        os.makedirs(RECOVERY_DIR)
-
+# =======================================================================
+# ✅ 文件名函数（改为用 selected_project）
+# =======================================================================
 def get_current_filename(theme):
-    """
-    生成文件名：Opening_主题_日期.jsonl
-    """
-    # 清洗文件名中的非法字符
     safe_theme = "".join([c for c in theme if c.isalnum() or c in (' ', '_', '-')]).strip()
-    if not safe_theme: safe_theme = "Untitled_Project"
-    
-    date_str = datetime.datetime.now().strftime("%Y%m%d") 
-    return f"Opening_{safe_theme}_{date_str}.jsonl"
+    if not safe_theme:
+        safe_theme = "Untitled_Project"
+    date_str = datetime.datetime.now().strftime("%Y%m%d")
+    return f"Opening_{selected_project}_{safe_theme}_{date_str}.jsonl"
+
+
+# --- 数据转换与读写函数 ---
+def convert_numpy(obj):
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
 
 def save_batch_record(record_dict, filename):
-    """
-    保存单个 Batch 的处理结果
-    """
-    ensure_recovery_dir()
-    filepath = os.path.join(RECOVERY_DIR, filename)
+    filepath = os.path.join(DIRS["opening_autosave"], filename)
     record_dict['timestamp'] = datetime.datetime.now().isoformat()
     try:
+        clean_dict = convert_numpy(record_dict)
         with open(filepath, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record_dict, ensure_ascii=False) + "\n")
+            f.write(json.dumps(clean_dict, ensure_ascii=False) + "\n")
     except Exception as e:
         st.error(f"自动保存失败: {e}")
 
 def load_from_jsonl(filepath):
-    """
-    适配 Batch 结构的恢复逻辑
-    """
     records = []
     if os.path.exists(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
                 try:
-                    if line.strip(): records.append(json.loads(line))
-                except: continue
-    
+                    if line.strip():
+                        records.append(json.loads(line))
+                except:
+                    continue
+
     flat_codes = []
     processed_batches = set()
-    
+
     for r in records:
         b_id = r.get('batch_id')
         if b_id is not None:
-            processed_batches.add(b_id)
-            
-        codes_list = r.get('final_codes', []) 
+            processed_batches.add(int(b_id))
+
+        codes_list = r.get('final_codes', [])
         for c in codes_list:
             flat_codes.append(c)
-    
-    return pd.DataFrame(flat_codes), processed_batches
+
+    df = pd.DataFrame(flat_codes)
+
+    for col in OPEN_CODES_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    return df, processed_batches
 
 # =======================================================================
-# 1. 核心逻辑函数区
+# 1. 核心逻辑函数与页面配置 (保持不变)
 # =======================================================================
 
-def call_qwen_api(api_key, model_id, prompt_text, temperature=0.1):
+def process_single_batch(batch_id, df_atomic, prompt_mode,
+                         custom_prompt, core_theme,
+                         definition_logic, exclusion_logic,
+                         api_key, model_id, temperature):
+
+    batch_rows = df_atomic[df_atomic['batch_id'] == batch_id]
+
+    batch_text = "\n".join([
+        f"[{r['global_id']}] {r['content']}"
+        for _, r in batch_rows.iterrows()
+    ])
+
+    if prompt_mode == "3. 高级自定义 (完全手动)":
+        prompt = custom_prompt.replace("{batch_text}", batch_text)
+    else:
+        prompt = create_final_coding_prompt(
+            core_theme,
+            definition_logic,
+            exclusion_logic,
+            batch_text
+        )
+
+    res = call_llm_api(api_key, model_id, prompt, temperature)
+
+    return batch_id, res, batch_rows, batch_text
+
+
+with st.sidebar:
+    # =======================
+    # 3️⃣ 恢复历史记录
+    # =======================
+    st.subheader("📥 恢复进度")
+
+    jsonl_files = glob.glob(os.path.join(DIRS["opening_autosave"], "*.jsonl"))
+    jsonl_files.sort(key=os.path.getmtime, reverse=True)
+
+    if jsonl_files:
+        history_file = st.selectbox(
+            "选择历史文件",
+            [os.path.basename(f) for f in jsonl_files]
+        )
+
+        if st.button("🔄 恢复选中文件",
+                     type="primary",
+                     use_container_width=True):
+
+            filepath = os.path.join(DIRS["opening_autosave"], history_file)
+            loaded_df, processed_set = load_from_jsonl(filepath)
+
+            if not loaded_df.empty:
+                st.session_state.open_codes = loaded_df
+                st.session_state.processed_batches = processed_set
+                st.success(f"恢复 {len(loaded_df)} 条记录")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.warning("文件中无有效数据")
+    else:
+        st.caption("当前项目暂无历史备份")
+
+    st.divider()
+
+    # =======================
+    # 4️⃣ 清空当前进度
+    # =======================
+    if st.button("🗑 清空当前进度",
+                 use_container_width=True):
+        hard_reset_opening_project()
+        st.success("已清空进度")
+        time.sleep(0.5)
+        st.rerun()
+
+    st.caption("⚠️ 请勿修改原始文件名或顺序，以免影响断点续传")
+
+def get_api_key(provider_name: str) -> str:
+    return st.secrets.get(provider_name, "")
+
+def call_llm_api(api_key, model_id, prompt_text, temperature=0.1):
     try:
-        if model_id in ["qwen-max", "qwen-plus", "deepseek-v3", "deepseek-r1", "kimi-k2-thinking", "glm-4.6"]:
-            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            client_key = api_key 
-        elif model_id.startswith("gpt"):
+        if model_id.startswith("gpt-4o"):
             base_url = "https://api.openai.com/v1"
-            client_key = st.session_state.get('openai_key', api_key) 
+            client_key = api_key
         elif model_id.startswith("gemini"):
-            base_url = "https://api.gemini.com/v1" 
-            client_key = st.session_state.get('gemini_key', api_key) 
+            base_url = "https://api.gemini.com/v1"
+            client_key = api_key
         else:
             base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             client_key = api_key
 
+
         client = OpenAI(api_key=client_key, base_url=base_url)
-        
+
         response = client.chat.completions.create(
             model=model_id,
             temperature=temperature,
@@ -104,16 +298,15 @@ def call_qwen_api(api_key, model_id, prompt_text, temperature=0.1):
         usage = response.usage
         total_tokens = getattr(usage, "total_tokens", 0)
         return {"success": True, "text": response.choices[0].message.content, "tokens": total_tokens}
-    
+
     except Exception as e:
         error_str = str(e)
-        # [FIX] 增加友好的错误提示
         if "401" in error_str or "Incorrect API key" in error_str:
             return {"success": False, "error": "⚠️ API Key 无效 (401)：请检查密钥是否复制完整、是否有多余空格，或账户是否欠费。", "tokens": 0}
         else:
             return {"success": False, "error": f"API Exception: {error_str}", "tokens": 0}
 
-# [FIXED] 修复了参数定义，现在可以接收 start_char 了
+
 def extract_json(text, start_char='[', end_char=']'):
     try:
         start = text.find(start_char)
@@ -123,293 +316,181 @@ def extract_json(text, start_char='[', end_char=']'):
         return [] if start_char == '[' else {}
     except:
         return [] if start_char == '[' else {}
+def _normalize_id_list(raw_value):
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        raw_value = [raw_value]
+    if not isinstance(raw_value, list):
+        return []
 
-def reconstruct_quote_and_validate(ai_item, atomic_lookup):
-    """ 
-    守门员逻辑: 
-    1. 接收 AI 返回的 IDs
-    2. 校验 ID 是否存在且非 Q 开头
-    3. 拼接原文
-    """
-    raw_ids = ai_item.get('ids', [])
-    if isinstance(raw_ids, str): raw_ids = [raw_ids]
-    
+    cleaned = []
+    seen = set()
+    for item in raw_value:
+        uid = str(item).strip()
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        cleaned.append(uid)
+    return cleaned
+
+
+def _get_valid_a_rows(id_list, atomic_lookup):
     valid_ids = []
-    quote_parts = []
     source_files = set()
-    
-    for uid in raw_ids:
-        # 校验1: ID是否存在
-        if uid not in atomic_lookup.index: continue
-        
+    rows_by_id = {}
+
+    for uid in id_list:
+        if uid not in atomic_lookup.index:
+            continue
+
         try:
             row = atomic_lookup.loc[uid]
-            if isinstance(row, pd.DataFrame): row = row.iloc[0]
-        except: continue
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+        except:
+            continue
 
-        # 校验2: 身份协议 (Q不编)
-        if str(uid).startswith("Q-") or row['role_code'] == 'Q': continue
-            
+        if str(uid).startswith("Q-") or row['role_code'] == 'Q':
+            continue
+
         valid_ids.append(uid)
-        quote_parts.append(str(row['content']))
+        rows_by_id[uid] = row
         source_files.add(row['source_file'])
-        
-    if not valid_ids: return None
-        
+
+    return valid_ids, rows_by_id, source_files
+
+
+def _build_quote_and_highlight(span_ids, original_ids, rows_by_id):
+    quote_parts = []
+    highlight_parts = []
+    original_id_set = set(original_ids)
+
+    for uid in span_ids:
+        row = rows_by_id.get(uid)
+        if row is None:
+            continue
+
+        text = str(row['content'])
+        quote_parts.append(text)
+
+        # 这里不用 **加粗**，因为 st.data_editor 和 pandas.to_excel 不会渲染局部富文本
+        # 先用【】做稳定标记，人工复核最实用
+        if uid in original_id_set:
+            highlight_parts.append(f"【{text}】")
+        else:
+            highlight_parts.append(text)
+
+    return "".join(quote_parts), "".join(highlight_parts)
+
+
+def reconstruct_quote_and_validate(ai_item, atomic_lookup):
+    """
+    新逻辑:
+    1. original_ids = 核心命中 ids
+    2. evidence_span = 人工复核所需的最小自然语境范围
+    3. quote 按 evidence_span 重组
+    4. quote_highlight 也按 evidence_span 重组，但把 original_ids 对应内容做标记
+    """
+    raw_ids = _normalize_id_list(ai_item.get('ids', []))
+    raw_evidence_span = _normalize_id_list(ai_item.get('evidence_span', raw_ids))
+
+    valid_ids, id_rows, source_files_ids = _get_valid_a_rows(raw_ids, atomic_lookup)
+    valid_span_ids, span_rows, source_files_span = _get_valid_a_rows(raw_evidence_span, atomic_lookup)
+
+    if not valid_ids:
+        return None
+
+    # evidence_span 无效时，回退到 original_ids
+    if not valid_span_ids:
+        valid_span_ids = valid_ids
+        span_rows = id_rows
+        source_files_span = source_files_ids
+
+    # 用 evidence_span 拼 quote；用 original_ids 做高亮标记
+    quote_text, quote_highlight_text = _build_quote_and_highlight(
+        valid_span_ids,
+        valid_ids,
+        span_rows
+    )
+
+    source_files = source_files_ids.union(source_files_span)
+
     return {
         "code": ai_item.get('code', 'Unnamed Code'),
-        "quote": "".join(quote_parts), 
+        "quote": quote_text,
+        "quote_highlight": quote_highlight_text,
         "original_ids": valid_ids,
+        "evidence_span": valid_span_ids,
         "source_file": list(source_files)[0] if source_files else "Unknown",
         "confidence": ai_item.get('confidence', 3)
     }
 
-# Meta-Prompt
-def create_background_meta_prompt(core_theme):
-    return f"""
-你是一位专精于扎根理论方法论的顶尖专家。用户正在研究核心主题：“{core_theme}”。
-你的任务是：为后续的编码工作制定一套**操作化判别标准**。
-请严格、且仅输出以下 JSON 格式：
-{{
-  "definition_logic": "纳入标准：请用200字左右定义，什么样的文本才算属于这个主题？",
-  "exclusion_logic": "排除标准：请用200字左右定义，什么样即使沾边但也必须排除的内容？"
-}}
-"""
-
-# Final Coding Prompt
-def create_final_coding_prompt(core_theme, definition_logic, exclusion_logic, batch_text):
-    return f"""
-你是严谨的扎根理论专家。你正在处理经过原子化切分的访谈数据。每行文本都带有唯一ID，代表一个物理上的最小语境行。你的任务是对提供的[待处理文段]进行开放性编码。
-
-一、核心焦点
-{core_theme}
-
-二、判别标准
-* 纳入标准: {definition_logic}
-* 排除标准: {exclusion_logic}
-
-三、身份协议-必须严格执行
-* 输入文本每一行都带有 ID，例如 [Q-01-001] 或 [A-01-001]。
-* [Q-...] 开头的行：是访谈者/主持人。这些行仅作为理解语境的背景信息。严禁对这些行生成编码！
-* [A-...] 开头的行：是受访者。你只能对这些行进行编码。
-
-四、编码原则
-原则一：语义纯化：Code必须是语义完整且最简短的词组。删除原文中不包含核心意义的语言赘述（如口头禅、连接词、冗余的主语）。
-原则二：语义挖掘：有时一行短句可能包含多个独立的动作、情感或观点。不要合并意义！必须对同一行 ID 生成多条不同的 Code，精准捕捉每一个微小的意义单元。
-原则三：语境重组: 务必审视上下文。如果相邻的几行共同构成可编码的独立单元，请将这些 ID 打包，赋予同一个 Code。
-原则四：贴地性原则：Code 必须是低级、具象的描述性短语，拒绝抽象概念。
-
-五、编码步骤
-1.扫描: 阅读文本，利用 Q 端理解语境，锁定 A 端内容。
-3.意义单元界定:
-    * 判断当前行是否包含多个独立意义？若有，进行语义挖掘（原则二）
-    * 判断当前行是否需要联系上文才能读懂？若需，进行语境重组（原则三）
-3.穷尽性审计：
-    * 重新核对：将你生成的初始代码列表与[待处理文段]进行对比。
-    * 检查遗漏：检查原始文段中是否还有任何符合纳入标准的、但未被编码的并列词、转折句或对立概念（例如：既要A又要B）。
-    * 补充：如果发现遗漏，请立即补充完整。
-4.提炼与命名：对所有代码执行剥离外壳，保留内核，并进行净化提炼。对每个意义单元，执行原则一（语义纯化）和原则四（贴地性原则），生成最终 Code。
-5.零引文：不要返回原文 Quote，仅返回 IDs。
-6.进行置信度confidence评分：进行五点评分，1分为非常不确定，2分为比较确定，3分为有点确定，4分为比较确定，5分为非常确定。
-7.格式化：生成JSON。
-
-六、输出格式
-只输出一个JSON数组，每个对象必须包含 code 、ids和confidence。
-多条编码示例:
-[
-  {{
-    "code": "(第一个编码标签)",
-    "ids": ["A-01-005", "A-01-006"], 
-    "confidence": 5
-  }},
-  {{
-    "code": "(第二个编码标签)",
-    "ids": ["A-01-006"], 
-    "confidence": 4
-  }}
-]
-零条编码示例: []
-
-[待处理文段]:
-{batch_text}
-
-提醒：严格遵守判别标准与编码步骤，按照规定JSON格式输出！不输出其他内容！
-"""
-
-def get_manual_prompt_template():
-    return """
-你是严谨的扎根理论专家。你正在处理经过原子化切分的访谈数据。每行文本都带有唯一ID，代表一个物理上的最小语境行。你的任务是对提供的[待处理文段]进行开放性编码。
-
-1. 核心焦点
-[请在此处输入核心焦点研究主题]
-
-2. 判别标准
-* 纳入标准: [请粘贴纳入标准]
-* 排除标准: [请粘贴排除标准]
-
-三、身份协议-必须严格执行
-* 输入文本每一行都带有 ID，例如 [Q-01-001] 或 [A-01-001]。
-* [Q-...] 开头的行：是访谈者/主持人。这些行仅作为理解语境的背景信息。严禁对这些行生成编码！
-* [A-...] 开头的行：是受访者。你只能对这些行进行编码。
-
-四、编码原则
-原则一：语义纯化：Code必须是语义完整且最简短的词组。删除原文中不包含核心意义的语言赘述（如口头禅、连接词、冗余的主语）。
-原则二：语义挖掘：有时一行短句可能包含多个独立的动作、情感或观点。不要合并意义！必须对同一行 ID 生成多条不同的 Code，精准捕捉每一个微小的意义单元。
-原则三：语境重组: 务必审视上下文。如果相邻的几行共同构成可编码的独立单元，请将这些 ID 打包，赋予同一个 Code。
-原则四：贴地性原则：Code 必须是低级、具象的描述性短语，拒绝抽象概念。
-
-五、编码步骤
-1.扫描: 阅读文本，利用 Q 端理解语境，锁定 A 端内容。
-3.意义单元界定:
-    * 判断当前行是否包含多个独立意义？若有，进行语义挖掘（原则二）
-    * 判断当前行是否需要联系上文才能读懂？若需，进行语境重组（原则三）
-3.穷尽性审计：
-    * 重新核对：将你生成的初始代码列表与[待处理文段]进行对比。
-    * 检查遗漏：检查原始文段中是否还有任何符合纳入标准的、但未被编码的并列词、转折句或对立概念（例如：既要A又要B）。
-    * 补充：如果发现遗漏，请立即补充完整。
-4.提炼与命名：对所有代码执行剥离外壳，保留内核，并进行净化提炼。对每个意义单元，执行原则一（语义纯化）和原则四（贴地性原则），生成最终 Code。
-5.零引文：不要返回原文 Quote，仅返回 IDs。
-6.进行置信度confidence评分：进行五点评分，1分为非常不确定，2分为比较确定，3分为有点确定，4分为比较确定，5分为非常确定。
-7.格式化：生成JSON。
-
-六、输出格式
-只输出一个JSON数组，每个对象必须包含 code 、ids和confidence。
-多条编码示例:
-[
-  {{
-    "code": "(第一个编码标签)",
-    "ids": ["A-01-005", "A-01-006"], 
-    "confidence": 5
-  }},
-  {{
-    "code": "(第二个编码标签)",
-    "ids": ["A-01-006"], 
-    "confidence": 4
-  }}
-]
-零条编码示例: []
-
-[待处理文段]:
-{batch_text}
-
-提醒：严格遵守判别标准与编码步骤，按照规定JSON格式输出！不输出其他内容！
-"""
-
-# [FIX] 移除了 @st.cache_data 以解决 unhashable type: list 错误
 def to_excel(df_raw, df_codes, df_meta):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        if df_raw is not None: df_raw.to_excel(writer, index=False, sheet_name='raw_data')
-        if df_codes is not None: 
-            # 兼容处理：将 list 类型的 ids 转为字符串保存
+        if df_codes is not None:
             df_save = df_codes.copy()
+
             if 'original_ids' in df_save.columns:
                 df_save['original_ids'] = df_save['original_ids'].astype(str)
+
+            if 'evidence_span' in df_save.columns:
+                df_save['evidence_span'] = df_save['evidence_span'].astype(str)
+
+            if 'quote_highlight' in df_save.columns:
+                df_save['quote_highlight'] = df_save['quote_highlight'].astype(str)
+
             df_save.to_excel(writer, index=False, sheet_name='open_codes')
-        if df_meta is not None: df_meta.to_excel(writer, index=False, sheet_name='project_meta')
+
+        # if df_meta is not None:
+        #     df_meta.to_excel(writer, index=False, sheet_name='project_meta')
+
     return output.getvalue()
 
 # =======================================================================
-# 2. 页面与数据加载逻辑
+# 3. 数据载入拦截器 (逻辑修正：确保载入后能看到恢复的数据)
 # =======================================================================
+if st.session_state.get('final_coding_data') is None:
+    st.title(f"🚀 区域2: 开放性编码 ｜ 项目准备: {selected_project}")
 
-# Session State
-if 'prompt_mode' not in st.session_state: st.session_state.prompt_mode = "1. 智能向导 (全自动)" 
-if 'custom_prompt' not in st.session_state: st.session_state.custom_prompt = get_manual_prompt_template()
-if 'definition_logic' not in st.session_state: st.session_state.definition_logic = ""
-if 'exclusion_logic' not in st.session_state: st.session_state.exclusion_logic = ""
-if 'open_codes' not in st.session_state: st.session_state.open_codes = pd.DataFrame(columns=['source_file', 'code', 'quote', 'confidence', 'original_ids', 'batch_id'])
-if 'core_theme' not in st.session_state: st.session_state.core_theme = "（请在此输入您的研究主题）" 
-if 'selected_model' not in st.session_state: st.session_state.selected_model = "qwen-plus"
-if 'openai_key' not in st.session_state: st.session_state.openai_key = "" 
-if 'gemini_key' not in st.session_state: st.session_state.gemini_key = "" 
-if 'stop_requested' not in st.session_state: st.session_state.stop_requested = False
-if 'is_processing' not in st.session_state: st.session_state.is_processing = False
-if 'temperature' not in st.session_state: st.session_state.temperature = 0.1
-if 'total_token_usage' not in st.session_state: st.session_state.total_token_usage = 0
-if 'processed_batches' not in st.session_state: st.session_state.processed_batches = set()
+    open_codes_df = st.session_state.get("open_codes")
+    rec_count = len(open_codes_df) if open_codes_df is not None else 0
 
-st.set_page_config(page_title="区域2: 开放性编码", layout="wide")
+    if rec_count > 0:
+        st.success(f"📈 内存中已载入历史进度：{rec_count} 条编码。请继续载入对应的原始数据以激活 AI。")
 
-# --- 数据源获取逻辑 ---
-df_atomic = None
-atomic_lookup = None
+    st.info("💡 请载入 Step 1 生成的预处理文件（xlsx/csv）")
 
-if 'final_coding_data' in st.session_state and st.session_state.final_coding_data is not None:
-    df_atomic = st.session_state.final_coding_data
-else:
-    st.warning("⚠️ 未检测到 Step 1 的处理数据。请上传 Step 1 下载的 Processed_xxxx.xlsx 文件。")
-    uploaded_file = st.file_uploader("📂 上传数据表", type=["xlsx", "csv"]) # 增加 csv 支持
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                df_atomic = pd.read_csv(uploaded_file)
-            else:
-                df_atomic = pd.read_excel(uploaded_file)
-            
-            if 'global_id' in df_atomic.columns and 'batch_id' in df_atomic.columns:
-                st.session_state.final_coding_data = df_atomic
-                st.success("✅ 数据加载成功！")
-                st.rerun() # 刷新页面
-            else:
-                st.error("表格格式错误：缺少 global_id 或 batch_id 列。")
-                df_atomic = None
-        except Exception as e:
-            st.error(f"读取失败: {e}")
+    t1, t2 = st.tabs(["📁 从云端目录导入", "📤 本地上传"])
+    with t1:
+        server_files = []
+        if os.path.exists(DIRS["preprocessed"]):
+            server_files = [f for f in os.listdir(DIRS["preprocessed"]) if f.endswith(('.xlsx', '.csv'))]
 
-if df_atomic is None:
-    st.stop() 
+        if server_files:
+            target_f = st.selectbox("选择文件:", ["-- 请选择 --"] + server_files, key="data_load_key")
+            if st.button("✅ 确认载入数据并开始", type="primary"):
+                if target_f != "-- 请选择 --":
+                    p = os.path.join(DIRS["preprocessed"], target_f)
+                    df = pd.read_csv(p) if p.endswith('.csv') else pd.read_excel(p)
+                    st.session_state.final_coding_data = df
+                    st.rerun()
+        else:
+            st.warning("1_preprocessed_data 文件夹为空。")
 
-# 建立索引以便快速查找 (Gatekeeper 用)
-atomic_lookup = df_atomic.set_index('global_id')
-
-# 侧边栏：历史存档恢复
-with st.sidebar:
-    st.header("📂 进度管理")
-    
-    # 撤回功能
-    if st.session_state.processed_batches:
-        # 获取最新的 batch_id
-        last_batch = sorted(list(st.session_state.processed_batches))[-1]
-        if st.button(f"↩️ 撤回 Batch {last_batch}", type="secondary"):
-            st.session_state.open_codes = st.session_state.open_codes[st.session_state.open_codes['batch_id'] != last_batch]
-            st.session_state.processed_batches.remove(last_batch)
-            st.warning(f"已撤回 Batch {last_batch}。")
+    with t2:
+        up = st.file_uploader("手动上传原始数据", type=["xlsx", "csv"])
+        if up:
+            df_up = pd.read_csv(up) if up.name.endswith('.csv') else pd.read_excel(up)
+            st.session_state.final_coding_data = df_up
             st.rerun()
-            
-    st.divider()
-    
-    st.warning("⚠️ 注意：为了保证断点续传的准确性，请勿在研究过程中随意修改上传文件的文件名或行顺序。")
-    ensure_recovery_dir()
-    jsonl_files = glob.glob(os.path.join(RECOVERY_DIR, "*.jsonl"))
-    jsonl_files.sort(key=os.path.getmtime, reverse=True)
-    
-    if jsonl_files:
-        st.subheader("📥 恢复进度")
-        selected_file = st.selectbox("选择历史文件", [os.path.basename(f) for f in jsonl_files], index=0)
-        
-        if st.button("🔄 载入选中文件"):
-            filepath = os.path.join(RECOVERY_DIR, selected_file)
-            loaded_df, processed_set = load_from_jsonl(filepath)
-            
-            if not loaded_df.empty:
-                st.session_state.open_codes = loaded_df
-                st.session_state.processed_batches = processed_set
-                st.success(f"✅ 成功恢复 {len(loaded_df)} 条编码记录！")
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.warning("该文件为空或格式不包含有效数据")
-    else:
-        st.caption("暂无历史存档")
-        
-    st.divider()
-    if st.button("🗑️ 清空当前进度 (重新开始)", type="secondary"):
-        st.session_state.open_codes = pd.DataFrame(columns=['source_file', 'code', 'quote', 'confidence', 'original_ids', 'batch_id'])
-        st.session_state.processed_batches = set()
-        st.success("已清空进度。")
-        time.sleep(1)
-        st.rerun()
+    st.warning("无原始数据")
+    st.stop()
+
+# --- 数据就绪 ---
+df_atomic = st.session_state.final_coding_data
+atomic_lookup = df_atomic.set_index('global_id')
 
 st.title("区域2: 开放性编码 Prompt生成与执行区 🛠️")
 
@@ -418,49 +499,56 @@ st.title("区域2: 开放性编码 Prompt生成与执行区 🛠️")
 # =======================================================================
 with st.container(border=True):
     st.subheader("步骤 1: 配置模式与规则")
-    
-    col_key, col_model = st.columns(2)
-    with col_key:
-        st.markdown("###### 🔑 密钥配置")
-        api_key_input = st.text_input("DashScope Key (Qwen/DeepSeek/GLM)", type="password", value=st.session_state.get('api_key', ''), label_visibility="collapsed", help="用于 Qwen, DeepSeek, GLM")
-        if api_key_input: st.session_state.api_key = api_key_input
-        st.session_state.openai_key = st.text_input("OpenAI Key (GPT-4o)", type="password", value=st.session_state.get('openai_key', ''), help="用于 GPT-4o")
-        st.session_state.gemini_key = st.text_input("Gemini Key (Gemini)", type="password", value=st.session_state.get('gemini_key', ''), help="用于 Gemini")
-    
-    with col_model:
-        st.markdown("###### 🧠 模型选择")
-        model_options = {
-            "👑 Qwen-Max (阿里旗舰)": "qwen-max",
-            "🌟 GPT-4o (全球旗舰)": "gpt-4o",
-            "🚀 Gemini 2.5 Pro (Google 旗舰)": "gemini-2.5-pro",
-            "💎 GLM-4.6 (智谱AI旗舰)": "glm-4.6",
-            "🔥 DeepSeek-V3 (逻辑强)": "deepseek-v3",
-            "⚖️ Qwen-Plus (平衡推荐)": "qwen-plus",
-        }
-        model_ids = list(model_options.values())
-        try: default_index = model_ids.index(st.session_state.selected_model)
-        except ValueError: default_index = 0 
-        selected_model_name = st.selectbox("选择模型", options=model_options.keys(), index=default_index, label_visibility="collapsed")
-        st.session_state.selected_model = model_options[selected_model_name]
+
+    st.markdown("###### 🧠 模型选择")
+    model_options = {
+        "👑 Qwen-Max": "qwen-max",
+        # "🌟 GPT-4o": "gpt-4o",
+        # "🚀 Gemini": "gemini",
+        "💎 GLM-4.6": "glm-4.6",
+        "🔥 DeepSeek-V3.2": "deepseek-v3.2",
+        "🔥 DeepSeek-R1": "deepseek-r1",
+        "⚖️ Qwen-Plus": "qwen-plus",
+    }
+    model_ids = list(model_options.values())
+    try:
+        default_index = model_ids.index(st.session_state.selected_model)
+    except ValueError:
+        default_index = 0
+    selected_model_name = st.selectbox("选择模型", options=model_options.keys(), index=default_index, label_visibility="collapsed")
+    st.session_state.selected_model = model_options[selected_model_name]
+
+    if st.session_state.selected_model.startswith("gpt-4o"):
+        st.session_state.api_key = get_api_key("OPENAI_API_KEY")
+    elif st.session_state.selected_model.startswith("gemini"):
+        st.session_state.api_key = get_api_key("GEMINI_API_KEY")
+    else:
+        st.session_state.api_key = get_api_key("QWEN_API_KEY")
 
     st.divider()
     mode_options = ["1. 智能向导 (全自动)", "2. 外部辅助 (推荐，需用到网页端，适用最新大模型) ", "3. 高级自定义 (完全手动)"]
-    st.session_state.prompt_mode = st.radio("选择工作模式", mode_options, horizontal=True)
+    selected_mode = st.radio("选择工作模式", mode_options, horizontal=True)
+    st.session_state.prompt_mode = selected_mode
+
 
     st.markdown("#### 1. 核心研究主题")
-    core_theme_input = st.text_input("研究主题", value=st.session_state.core_theme, label_visibility="collapsed")
-    st.session_state.core_theme = core_theme_input
+    st.text_input("研究主题", key="core_theme", label_visibility="collapsed")
+    core_theme_input = st.session_state.core_theme
 
     # --- 模式 A: 智能向导 ---
     if st.session_state.prompt_mode == "1. 智能向导 (全自动)":
         if st.button("🤖 一键生成判别标准", type="primary"):
-            if not st.session_state.api_key: st.error("请输入 DashScope Key！"); st.stop()
-            elif not core_theme_input or "请在" in core_theme_input: st.error("请输入有效主题！"); st.stop()
-            
+            if not st.session_state.api_key:
+                st.error("请输入 DashScope Key！")
+                st.stop()
+            elif not core_theme_input or "请在" in core_theme_input:
+                st.error("请输入有效主题！")
+                st.stop()
+
             with st.spinner("正在分析..."):
                 meta_prompt = create_background_meta_prompt(st.session_state.core_theme)
-                api_res = call_qwen_api(st.session_state.api_key, st.session_state.selected_model, meta_prompt, temperature=0.3)
-                
+                api_res = call_llm_api(st.session_state.api_key, st.session_state.selected_model, meta_prompt, temperature=0.3)
+
                 if api_res["success"]:
                     st.session_state.total_token_usage += api_res["tokens"]
                     data = extract_json(api_res["text"], start_char='{', end_char='}')
@@ -468,8 +556,10 @@ with st.container(border=True):
                         st.session_state.definition_logic = data.get('definition_logic', '')
                         st.session_state.exclusion_logic = data.get('exclusion_logic', '')
                         st.success("标准生成成功！请在下方确认。")
-                    else: st.error(f"生成失败: {data}")
-                else: st.error(api_res["error"])
+                    else:
+                        st.error(f"生成失败: {data}")
+                else:
+                    st.error(api_res["error"])
 
     # --- 模式 B: 外部辅助 ---
     elif st.session_state.prompt_mode == "2. 外部辅助 (推荐，需用到网页端，适用最新大模型) ":
@@ -483,182 +573,342 @@ with st.container(border=True):
     # --- 模式 3: 高级自定义 ---
     else:
         st.warning("🛠️ **专家模式：** 您完全控制 Prompt。注意：请使用 `{batch_text}` 作为文本占位符。")
-        st.session_state.custom_prompt = st.text_area("完整 Prompt 编辑器", value=st.session_state.custom_prompt, height=400)
-    
+
+        current_prompt = st.session_state.get("custom_prompt_editor")
+        if current_prompt is None or str(current_prompt).strip() == "":
+            current_prompt = st.session_state.get("custom_prompt") or DEFAULT_CUSTOM_PROMPT
+
+        edited_prompt = st.text_area(
+            "完整 Prompt 编辑器",
+            value=current_prompt,
+            height=400
+        )
+
+        st.session_state.custom_prompt_editor = edited_prompt
+        st.session_state.custom_prompt = edited_prompt
+
+
     # --- 公共区域：显示/编辑标准 ---
     st.divider()
     if st.session_state.prompt_mode in ["1. 智能向导 (全自动)", "2. 外部辅助 (推荐，需用到网页端，适用最新大模型) "]:
         col_def, col_exc = st.columns(2)
         with col_def:
-            st.session_state.definition_logic = st.text_area("✅ 纳入标准 (Definition)", value=st.session_state.definition_logic, height=100)
+            edited_def = st.text_area(
+                "✅ 纳入标准 (Definition)",
+                value=st.session_state.get("definition_logic", ""),
+                height=100
+            )
+            st.session_state.definition_logic = edited_def
+
         with col_exc:
-            st.session_state.exclusion_logic = st.text_area("❌ 排除标准 (Exclusion)", value=st.session_state.exclusion_logic, height=100)
+            edited_exc = st.text_area(
+                "❌ 排除标准 (Exclusion)",
+                value=st.session_state.get("exclusion_logic", ""),
+                height=100
+            )
+            st.session_state.exclusion_logic = edited_exc
 
 # =======================================================================
-# 4. 执行区域
+# 4. 执行区域（不卡UI版本）
 # =======================================================================
-can_run = False
-if st.session_state.prompt_mode == "3. 高级自定义 (完全手动)":
-    can_run = "{batch_text}" in st.session_state.custom_prompt 
-    if not can_run and "{text_to_code}" in st.session_state.custom_prompt:
-        st.error("检测到旧版占位符 `{text_to_code}`，请替换为 `{batch_text}` 以适配新的组块逻辑。")
-elif st.session_state.definition_logic and st.session_state.exclusion_logic:
-    can_run = True
+with st.container(border=True):
+    st.subheader("步骤 2: 批量编码执行")
 
-if can_run:
+    # ========= 是否允许运行（只控制按钮） =========
+    can_run = False
+    if st.session_state.prompt_mode == "3. 高级自定义 (完全手动)":
+        current_prompt = st.session_state.get("custom_prompt_editor") or DEFAULT_CUSTOM_PROMPT
+        can_run = "{batch_text}" in current_prompt
+    elif st.session_state.definition_logic and st.session_state.exclusion_logic:
+        can_run = True
+
+    # ========= 数据准备 =========
     if df_atomic is None:
         st.warning("⚠️ 请先加载数据。")
         st.stop()
-        
-    with st.container(border=True):
-        st.subheader("步骤 2: 批量编码执行")
-        
-        # 准备数据
-        unique_batches = sorted(df_atomic['batch_id'].unique())
-        pending_batches = [b for b in unique_batches if b not in st.session_state.processed_batches]
-        
-        st.markdown(f"**任务统计**: 总组块 `{len(unique_batches)}` | 已完成 `{len(st.session_state.processed_batches)}` | 待处理 `{len(pending_batches)}`")
-        
-        c_p_preview = st.expander("👀 查看当前 Batch Prompt 预览")
-        
-        col_act1, col_act2, col_act3 = st.columns([1, 1, 3])
-        
-        if col_act1.button("▶️ 开始/继续", type="primary", disabled=len(pending_batches)==0):
-            st.session_state.is_coding = True
-            st.rerun()
-            
-        if col_act2.button("test (测试1条)"):
-            st.session_state.is_coding = True
-            st.session_state.test_mode = True
-            st.rerun()
-            
-        if st.session_state.get('is_coding', False):
-            if st.button("⏹️ 暂停/停止"): 
-                st.session_state.is_coding = False
-                st.rerun()
-            
-            progress_bar = st.progress(0, text="初始化...")
-            log_container = st.empty()
-            log_messages = []
-            
-            total = len(pending_batches)
-            if total == 0:
-                st.success("🎉 所有组块已处理完毕。")
-                st.session_state.is_processing = False
-                st.rerun()
 
-            count = 0
-            for i, batch_id in enumerate(pending_batches):
-                if st.session_state.stop_requested: st.error("已停止"); st.session_state.is_processing = False; st.rerun(); break
-                if not st.session_state.is_coding: break
-                
-                # 1. 组装 Batch Text
-                batch_rows = df_atomic[df_atomic['batch_id'] == batch_id]
-                batch_text_lines = []
-                for _, r in batch_rows.iterrows():
-                    batch_text_lines.append(f"[{r['global_id']}] {r['content']}")
-                batch_text_full = "\n".join(batch_text_lines)
+    unique_batches = sorted(df_atomic['batch_id'].unique())
+    pending_batches = [b for b in unique_batches if b not in st.session_state.processed_batches]
 
-                # Prompt 预览更新 (仅第一条)
-                if i == 0:
-                    if st.session_state.prompt_mode == "3. 高级自定义 (完全手动)":
-                         preview = st.session_state.custom_prompt.format(batch_text=batch_text_full)
-                    else:
-                         preview = create_final_coding_prompt(st.session_state.core_theme, st.session_state.definition_logic, st.session_state.exclusion_logic, batch_text_full)
-                    c_p_preview.code(preview)
+    st.markdown(
+        f"**任务统计**: 总组块 `{len(unique_batches)}` | 已完成 `{len(st.session_state.processed_batches)}` | 待处理 `{len(pending_batches)}`"
+    )
 
-                # 2. 构造 Prompt
-                if st.session_state.prompt_mode == "3. 高级自定义 (完全手动)":
-                    prompt = st.session_state.custom_prompt.format(batch_text=batch_text_full)
+    col_act1, col_act2, col_act3 = st.columns([1, 1, 1])
+
+    if col_act1.button(
+        "▶️ 开始/继续",
+        type="primary",
+        disabled=(len(pending_batches) == 0 or not can_run)
+    ):
+        st.session_state.is_coding = True
+        st.session_state.is_paused = False
+        st.rerun()
+
+    if col_act2.button("⏸️ 暂停"):
+        st.session_state.is_paused = True
+
+    if col_act3.button("🧪 测试1条"):
+        st.session_state.is_coding = True
+        st.session_state.test_mode = True
+        st.session_state.is_paused = False
+        st.rerun()
+
+    if not can_run:
+        st.info("⚠️ 请先完成上方提示词配置（纳入标准 & 排除标准 或 自定义Prompt）")
+
+    # ============================================================
+    # 🚀 执行引擎（只在 is_coding 时运行）
+    # ============================================================
+    if st.session_state.get("is_coding", False):
+
+        if st.session_state.get("is_paused", False):
+            if "executor" in st.session_state:
+                st.session_state.executor.shutdown(wait=False)
+                del st.session_state.executor
+            for k in [
+                "futures", "batch_groups", "submitted_index",
+                "submitted_batches", "handled_batches", "run_batches"
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.warning("⏸️ 已暂停")
+            st.stop()
+
+        # =========================
+        # 初始化（只执行一次）
+        # =========================
+        if "executor" not in st.session_state:
+            run_batches = pending_batches[:1] if st.session_state.get("test_mode", False) else pending_batches.copy()
+
+            st.session_state.executor = ThreadPoolExecutor(max_workers=3)
+            st.session_state.futures = []
+            st.session_state.submitted_index = 0
+            st.session_state.submitted_batches = set()
+            st.session_state.handled_batches = set()
+            st.session_state.run_batches = run_batches
+
+            st.session_state.batch_groups = {
+                b: df_atomic[df_atomic['batch_id'] == b]
+                for b in run_batches
+            }
+
+            st.session_state.log_messages = []
+
+        run_batches = st.session_state.get("run_batches", [])
+        total = len(run_batches)
+        completed_count = len(st.session_state.get("handled_batches", set()))
+        progress_value = min(completed_count / total, 1.0) if total > 0 else 0.0
+
+        # =========================
+        # UI组件
+        # =========================
+        progress_bar = st.progress(
+            progress_value,
+            text=f"进度: {completed_count}/{total}"
+        )
+
+        log_container = st.empty()
+
+        # =========================
+        # 提交任务（保证每个 batch 只提交一次）
+        # =========================
+        submit_per_cycle = 2
+
+        for _ in range(submit_per_cycle):
+            if st.session_state.submitted_index < total:
+                batch_id = run_batches[st.session_state.submitted_index]
+
+                if batch_id in st.session_state.submitted_batches:
+                    st.session_state.submitted_index += 1
+                    continue
+
+                current_prompt = st.session_state.get("custom_prompt_editor") or DEFAULT_CUSTOM_PROMPT
+
+                future = st.session_state.executor.submit(
+                    process_single_batch,
+                    batch_id,
+                    st.session_state.batch_groups[batch_id],
+                    st.session_state.prompt_mode,
+                    current_prompt,
+                    st.session_state.core_theme,
+                    st.session_state.definition_logic,
+                    st.session_state.exclusion_logic,
+                    st.session_state.api_key,
+                    st.session_state.selected_model,
+                    st.session_state.temperature
+                )
+
+                st.session_state.futures.append((batch_id, future))
+                st.session_state.submitted_batches.add(batch_id)
+                st.session_state.submitted_index += 1
+
+        # =========================
+        # 收集完成任务（保证每个 batch 只处理一次）
+        # =========================
+        done_list = []
+
+        for batch_id, f in st.session_state.futures:
+            if batch_id in st.session_state.handled_batches:
+                continue
+            if f.done():
+                done_list.append((batch_id, f))
+
+        for batch_id, f in done_list:
+
+            if (batch_id, f) in st.session_state.futures:
+                st.session_state.futures.remove((batch_id, f))
+
+            if batch_id in st.session_state.handled_batches:
+                continue
+
+            try:
+                batch_id, res, batch_rows, batch_text = f.result()
+            except Exception as e:
+                st.session_state.log_messages.append(f"❌ Batch {batch_id} 崩了: {e}")
+                st.session_state.handled_batches.add(batch_id)
+                continue
+
+            if res["success"]:
+
+                st.session_state.total_token_usage += res["tokens"]
+
+                raw_codes = extract_json(res["text"])
+                final_codes = []
+
+                if isinstance(raw_codes, list):
+                    for item in raw_codes:
+                        clean = reconstruct_quote_and_validate(item, atomic_lookup)
+                        if clean:
+                            clean["batch_id"] = batch_id
+                            final_codes.append(clean)
+
+                if final_codes:
+                    new_df = pd.DataFrame(final_codes)
+                    st.session_state.open_codes = pd.concat(
+                        [st.session_state.open_codes, new_df],
+                        ignore_index=True
+                    )
+
+                    st.session_state.processed_batches.add(batch_id)
+
+                    code_str = ", ".join([c['code'] for c in final_codes])
+                    log_msg = f"✅ Batch {batch_id} | {code_str}"
                 else:
-                    prompt = create_final_coding_prompt(st.session_state.core_theme, st.session_state.definition_logic, st.session_state.exclusion_logic, batch_text_full)
-                
-                # 3. 调用 API
-                res = call_qwen_api(st.session_state.api_key, st.session_state.selected_model, prompt, st.session_state.temperature)
-                
-                log_msg = ""
-                if res["success"]:
-                    st.session_state.total_token_usage += res["tokens"]
-                    raw_codes = extract_json(res["text"])
-                    
-                    final_codes_for_batch = []
-                    # 守门员校验
-                    if isinstance(raw_codes, list):
-                        for item in raw_codes:
-                            clean_item = reconstruct_quote_and_validate(item, atomic_lookup)
-                            if clean_item:
-                                clean_item['batch_id'] = batch_id
-                                final_codes_for_batch.append(clean_item)
+                    st.session_state.processed_batches.add(batch_id)
+                    log_msg = f"⚪ Batch {batch_id} | 无编码"
 
-                    if final_codes_for_batch:
-                        code_str = ", ".join([f"[{c['code']} ({c['confidence']}/5)]" for c in final_codes_for_batch])
-                        log_msg = f"✅ Batch {batch_id} | 🪙{res['tokens']} | 🏷️ {code_str}"
-                        
-                        # 更新 Session
-                        new_df = pd.DataFrame(final_codes_for_batch)
-                        st.session_state.open_codes = pd.concat([st.session_state.open_codes, new_df], ignore_index=True)
-                        
-                        # 持久化
-                        record_to_save = {
-                            "batch_id": int(batch_id),
-                            "source_file": batch_rows.iloc[0]['source_file'],
-                            "batch_summary": batch_text_full[:50]+"...", 
-                            "final_codes": final_codes_for_batch,
-                            "model": st.session_state.selected_model
-                        }
-                        filename = get_current_filename(st.session_state.core_theme)
-                        save_batch_record(record_to_save, filename)
-                        
-                        st.session_state.processed_batches.add(batch_id) 
-                    else: 
-                        log_msg = f"⚪ Batch {batch_id} | 🪙{res['tokens']} | 无有效编码"
-                        st.session_state.processed_batches.add(batch_id) 
-                else: 
-                    log_msg = f"❌ API错误: {res['error']}"
+            else:
+                log_msg = f"❌ {res['error']}"
 
-                if log_msg: log_messages.append(log_msg)
-                log_container.text_area("实时日志", value="\n".join(reversed(log_messages)), height=250)
-                
-                count += 1
-                progress_bar.progress(count / total, text=f"进度: {count}/{total} (正在处理 Batch {batch_id})")
-                
-                if st.session_state.get('test_mode', False):
-                    st.session_state.is_coding = False
-                    st.session_state.test_mode = False
-                    st.success("✅ 测试完成 (已处理1个组块)")
-                    st.rerun()
-            
-            if st.session_state.is_coding:
-                st.session_state.is_coding = False
-                st.success("🎉 完成！")
-                time.sleep(1); st.rerun()
+            st.session_state.log_messages.append(log_msg)
+            st.session_state.handled_batches.add(batch_id)
+
+        # =========================
+        # UI刷新
+        # =========================
+        completed_count = len(st.session_state.get("handled_batches", set()))
+        progress_value = min(completed_count / total, 1.0) if total > 0 else 0.0
+
+        progress_bar.progress(
+            progress_value,
+            text=f"进度: {completed_count}/{total}"
+        )
+
+        log_container.text_area(
+            "实时日志",
+            value="\n".join(reversed(st.session_state.log_messages)),
+            height=250
+        )
+
+        # =========================
+        # test模式
+        # =========================
+        if st.session_state.get("test_mode", False) and completed_count >= 1:
+            if "executor" in st.session_state:
+                st.session_state.executor.shutdown(wait=False)
+                del st.session_state.executor
+            for k in [
+                "futures", "batch_groups", "submitted_index",
+                "submitted_batches", "handled_batches", "run_batches"
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state.is_coding = False
+            st.session_state.test_mode = False
+            st.success("✅ 测试完成")
+            st.rerun()
+
+        # =========================
+        # 是否继续
+        # =========================
+        if completed_count < total:
+            time.sleep(0.2)
+            st.rerun()
+        else:
+            st.success("🎉 全部完成")
+
+            if "executor" in st.session_state:
+                st.session_state.executor.shutdown(wait=False)
+                del st.session_state.executor
+
+            for k in [
+                "futures", "batch_groups", "submitted_index",
+                "submitted_batches", "handled_batches", "run_batches"
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+
+            st.session_state.is_coding = False
 
 # =======================================================================
 # 5. 结果预览
 # =======================================================================
-if not st.session_state.open_codes.empty:
+if st.session_state.open_codes is not None and not st.session_state.open_codes.empty:
     with st.container(border=True):
         st.subheader("步骤 3: 结果预览与保存")
-        
-        cols = ['batch_id', 'source_file', 'code', 'quote', 'confidence', 'original_ids']
-        for c in cols: 
-            if c not in st.session_state.open_codes.columns: st.session_state.open_codes[c] = None
-            
+
+        cols = ['quote_highlight', 'quote', 'code', 'confidence', 'original_ids', 'evidence_span', 'batch_id', 'source_file']
+
+        for c in cols:
+            if c not in st.session_state.open_codes.columns:
+                st.session_state.open_codes[c] = None
+
         edited = st.data_editor(
-            st.session_state.open_codes, 
+            st.session_state.open_codes,
             column_order=cols,
-            disabled=['source_file', 'quote', 'original_ids', 'batch_id'],
-            num_rows="dynamic", key="editor", height=400
+            disabled=['source_file', 'quote', 'quote_highlight', 'original_ids', 'evidence_span', 'batch_id'],
+            num_rows="dynamic",
+            key="editor",
+            height=400
         )
         st.session_state.open_codes = edited
-        
+
         st.markdown("#### 保存项目")
         meta_bg = "Custom" if st.session_state.prompt_mode == "3. 高级自定义 (完全手动)" else f"纳入：{st.session_state.definition_logic}\n排除：{st.session_state.exclusion_logic}"
-            
+
         excel_data = to_excel(
-            df_atomic, 
-            edited, 
-            pd.DataFrame({"core_theme":[st.session_state.core_theme], "bg":[meta_bg]})
+            df_atomic,
+            edited,
+            pd.DataFrame({"core_theme": [st.session_state.core_theme], "bg": [meta_bg]})
         )
-        st.download_button("🚀 下载项目 (.xlsx)", data=excel_data, file_name=f"Project_{st.session_state.core_theme}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
-        st.page_link("pages/4_Axial_Coding.py", label="下一步 (轴心编码)", icon="➡️")
+        col1, col2 = st.columns([2, 1])
+        st.caption("💡 保存用于系统内继续分析；下载用于导出到本地")
+        with col1:
+            if st.button("💾 保存到项目（用于后续分析）", type="primary", use_container_width=True):
+                filename = f"{st.session_state.core_theme}_{time.strftime('%Y%m%d_%H%M')}_open_coding.xlsx"
+                save_path = os.path.join(DIRS["opening_final"], filename)
+
+                with open(save_path, "wb") as f:
+                    f.write(excel_data)
+
+                st.success("✅ 已保存到项目文件夹（Step 2）")
+        with col2:
+            st.download_button(
+                "⬇️ 下载副本到本地",
+                data=excel_data,
+                file_name=f"Project_{st.session_state.core_theme}_{time.strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        st.page_link("pages/3_Visual_Analysis.py", label="下一步 (多位编码者对齐与相似编码合并)", icon="➡️")
