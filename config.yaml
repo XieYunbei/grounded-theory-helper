@@ -1,0 +1,22 @@
+
+cookie:
+  expiry_days: 30
+  key: random_signature_key
+  name: gt_ai_assistant_cookie
+credentials:
+  usernames:
+    add:
+      email: 2022@163.com
+      first_name: "\u5341\u5927"
+      last_name: "\u6492\u6253\u7B97"
+      logged_in: false
+      password: $2b$12$AcPudCKQAnWhLVMqG0PNOuyjqNm1tcjXgHf0CxaKxsB/PEHLa81z6
+      password_hint: "\u4F60\u7684\u751F\u65E5"
+      roles: null
+    admin:
+      email: admin@example.com
+      failed_login_attempts: 0
+      first_name: Admin
+      last_name: User
+      logged_in: false
+      password: $2b$12$EixZaYVK1fsbw1ZfbX3OXePaWrn96pzvPenF9X1X/a9JCD.kaiIc.
