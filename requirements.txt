@@ -13,4 +13,4 @@ networkx
 streamlit-sortables
 streamlit-authenticator
 PyYAML
-docx
+python-docx
