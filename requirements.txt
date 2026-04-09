@@ -10,5 +10,7 @@ scikit-learn
 altair
 matplotlib
 networkx
-python-docx
 streamlit-sortables
+streamlit-authenticator
+PyYAML
+docx
