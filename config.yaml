@@ -20,3 +20,10 @@ credentials:
       last_name: User
       logged_in: false
       password: $2b$12$EixZaYVK1fsbw1ZfbX3OXePaWrn96pzvPenF9X1X/a9JCD.kaiIc.
+    user001:
+      email: 001@163.com
+      first_name: 用户
+      last_name: 用户
+      logged_in: false
+      password: $2b$12$B56cfZjThu8AWMLcdM4H9.FUpQ3qAIVrFOy03WdGcSHzFyVHInzce
+      roles: null
